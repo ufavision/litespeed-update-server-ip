@@ -185,25 +185,25 @@ find_wp_path() {
     local domain=$1 cpuser=$2
     local -n _wpret=$3
     _wpret=""
-    local home_dir
-    home_dir=$(getent passwd "$cpuser" 2>/dev/null | cut -d: -f6)
-    [[ -z "$home_dir" ]] && home_dir="/home/${cpuser}"
 
+    # ใช้ /home/cpuser โดยตรง
+    # - cPanel user ไม่มีใน /etc/passwd → getent ได้ "" ทุกครั้ง เสียเวลา
+    # - ไม่ใช้ whmapi1 fallback (~0.5-2s/domain → ค้างหนักถ้า path miss จำนวนมาก)
+    local home_dir="/home/${cpuser}"
+
+    # Priority 1: docroot จาก userdatadomains (เร็วที่สุด)
     local pre="${G_DOMAIN_DOCROOT[$domain]:-}"
     [[ -n "$pre" && -f "${pre}/wp-config.php" ]] && { _wpret="$pre"; return; }
-    [[ -f "${home_dir}/public_html/${domain}/wp-config.php" ]] && { _wpret="${home_dir}/public_html/${domain}"; return; }
-    [[ -f "${home_dir}/${domain}/wp-config.php" ]]             && { _wpret="${home_dir}/${domain}"; return; }
 
-    local docroot
-    docroot=$(whmapi1 --output=jsonpretty domainuserdata domain="$domain" 2>/dev/null \
-        | python3 -c "
-import sys,json
-try:
-    d=json.load(sys.stdin)
-    print(d.get('data',{}).get('userdata',{}).get('documentroot',''))
-except: print('')
-" 2>/dev/null | tr -d ' ')
-    [[ -n "$docroot" && -f "${docroot}/wp-config.php" ]] && _wpret="$docroot"
+    # Priority 2: /home/USER/public_html/DOMAIN/
+    [[ -f "${home_dir}/public_html/${domain}/wp-config.php" ]] \
+        && { _wpret="${home_dir}/public_html/${domain}"; return; }
+
+    # Priority 3: /home/USER/DOMAIN/
+    [[ -f "${home_dir}/${domain}/wp-config.php" ]] \
+        && { _wpret="${home_dir}/${domain}"; return; }
+
+    # ไม่เจอ = SKIP ทันที (ไม่มี whmapi1 fallback)
 }
 
 ###############################################################################
@@ -431,10 +431,21 @@ esac
 
 # ── SCAN: หา wp_path ────────────────────────────────────────────────────
 echo ""
-echo -e "${CYAN}  ⟳  กำลังสแกน domain...${NC}"
 
 declare -a JOB_LIST=()
 declare -a SCAN_SKIPS=()
+
+# Spinner ขณะสแกน
+(
+    _sp='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'; _si=0
+    while true; do
+        _si=$(( (_si+1) % 10 ))
+        printf "\r  ${CYAN}⟳  กำลังสแกน domain...${NC}  ${YELLOW}%s${NC}" "${_sp:$_si:1}"
+        sleep 0.1
+    done
+) &
+_SCAN_SPINNER_PID=$!
+disown "$_SCAN_SPINNER_PID"
 
 for _domain in $(printf '%s\n' "${!G_ADDON_DOMAINS[@]}" | sort); do
     _cpu="${G_ADDON_DOMAINS[$_domain]}"
@@ -446,6 +457,9 @@ for _domain in $(printf '%s\n' "${!G_ADDON_DOMAINS[@]}" | sort); do
         JOB_LIST+=("${_domain}|${_cpu}|${_wpp}")
     fi
 done
+
+kill "$_SCAN_SPINNER_PID" 2>/dev/null
+printf "\r\033[K"
 
 TOTAL=${#JOB_LIST[@]}
 
